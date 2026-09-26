@@ -29,12 +29,25 @@ type ConflictInfo struct {
 }
 
 // Step 是一次分析动作发生前的栈与剩余输入快照。
+// 恢复模式下，恢复动作额外携带 Recovery（同一事件序列，不另开通道）。
 type Step struct {
-	Step         int    `json:"step"`
-	Stack        string `json:"stack"`
-	Input        string `json:"input"`
-	Action       string `json:"action"`
-	ProductionID *int   `json:"productionId,omitempty"`
+	Step         int           `json:"step"`
+	Stack        string        `json:"stack"`
+	Input        string        `json:"input"`
+	Action       string        `json:"action"`
+	ProductionID *int          `json:"productionId,omitempty"`
+	Recovery     *RecoveryInfo `json:"recovery,omitempty"`
+}
+
+// RecoveryInfo 记录一次恐慌模式恢复：出错词位置、原栈顶、动作类别与恢复后的现场。
+// 每个恢复动作都保证推进（弹栈或消费输入），使回放必然终止。
+type RecoveryInfo struct {
+	Kind       string `json:"kind"` // pop-nonterminal | skip-token | insert-terminal | discard-tail
+	TokenIndex int    `json:"tokenIndex"` // 出错词下标（0 起）；等于词数表示结束符 $
+	Token      string `json:"token"`      // 当前词，"$" 表示输入结束
+	StackTop   string `json:"stackTop"`   // 原栈顶
+	AfterStack string `json:"afterStack"` // 恢复后的栈（栈顶在左）
+	AfterInput string `json:"afterInput"` // 恢复后的剩余输入
 }
 
 // Failure 是首个失败步骤的信息。
@@ -48,18 +61,21 @@ type Failure struct {
 
 // AnalyzeResult 是 /api/analyze 的完整服务端推导结果。
 type AnalyzeResult struct {
-	Status       string                      `json:"status"` // "conflict" | "parsed"
-	Start        string                      `json:"start"`
-	Nonterminals []string                    `json:"nonterminals"`
-	Terminals    []string                    `json:"terminals"`
-	Productions  []Production                `json:"productions"`
-	First        map[string][]string         `json:"first"`
-	Follow       map[string][]string         `json:"follow"`
-	Table        map[string]map[string][]int `json:"table"`
-	Conflict     *ConflictInfo               `json:"conflict"`
-	Accepted     bool                        `json:"accepted"`
-	Trace        []Step                      `json:"trace"`
-	Error        *Failure                    `json:"error"`
+	Status        string                      `json:"status"` // "conflict" | "parsed"
+	Start         string                      `json:"start"`
+	Nonterminals  []string                    `json:"nonterminals"`
+	Terminals     []string                    `json:"terminals"`
+	Productions   []Production                `json:"productions"`
+	First         map[string][]string         `json:"first"`
+	Follow        map[string][]string         `json:"follow"`
+	Table         map[string]map[string][]int `json:"table"`
+	Conflict      *ConflictInfo               `json:"conflict"`
+	Accepted      bool                        `json:"accepted"`
+	Trace         []Step                      `json:"trace"`
+	Error         *Failure                    `json:"error"`
+	RecoverMode   bool                        `json:"recoverMode"`   // 是否显式开启了错误恢复回放
+	HadError      bool                        `json:"hadError"`      // 恢复模式下是否发生过恢复（发生过即"含错误"）
+	RecoveryCount int                         `json:"recoveryCount"` // 恢复动作总数
 }
 
 type rawProd struct {
@@ -454,9 +470,129 @@ func (g *grammar) runParser(tokens []string) (bool, []Step, *Failure) {
 	}
 }
 
-// analyze 是入口：校验词序列长度，求集合、建表、定位冲突；
-// 有冲突时只返回表与冲突，不生成解析回放；无冲突时才运行分析器。
+// runParserRecover 错误恢复回放（恐慌模式）：查表为空或终结符不匹配时不立即停下，
+// 按固定策略回到可推导位置并继续，每个恢复动作都记录词下标、原栈顶与恢复后现场：
+//   - 非终结符查表为空：当前词 ∈ FOLLOW(栈顶) 或为结束符 $ 时弹出该非终结符，否则丢弃当前词
+//   - 栈顶终结符与当前词不符：记录补入该终结符并弹栈（不消耗输入）
+//   - 栈已到栈底仍有剩余输入：尾部多余词逐个丢弃
+//
+// 恢复动作要么缩小栈、要么推进输入，必然推进；整体仍受 maxSteps 上限约束。
+// 只要发生过恢复，即使最终走到结束符也返回 accepted=false（含错误），绝不伪报接受。
+func (g *grammar) runParserRecover(tokens []string) (bool, []Step, int) {
+	stack := []string{"$", g.start}
+	ip := 0
+	var trace []Step
+	recovered := 0
+
+	record := func(action string, pid *int, rec *RecoveryInfo) {
+		trace = append(trace, Step{
+			Step:         len(trace) + 1,
+			Stack:        g.stackText(stack),
+			Input:        inputText(tokens, ip),
+			Action:       action,
+			ProductionID: pid,
+			Recovery:     rec,
+		})
+	}
+	// recoverStep 先按"恢复后"的现场构造 RecoveryInfo，再以当前现场记录这一步。
+	recoverStep := func(action, kind, token, stackTop string, afterStack []string, afterIP int) {
+		recovered++
+		record(action, nil, &RecoveryInfo{
+			Kind:       kind,
+			TokenIndex: ip,
+			Token:      token,
+			StackTop:   stackTop,
+			AfterStack: g.stackText(afterStack),
+			AfterInput: inputText(tokens, afterIP),
+		})
+	}
+
+	for {
+		if len(trace) >= maxSteps {
+			record(fmt.Sprintf("分析步骤超过 %d，文法可能无法终止", maxSteps), nil, nil)
+			return false, trace, recovered
+		}
+		lookahead := "$"
+		if ip < len(tokens) {
+			lookahead = tokens[ip]
+		}
+		top := stack[len(stack)-1]
+
+		// 非法词：恢复模式下当作无法同步的词直接丢弃，不中断回放。
+		if lookahead != "$" && !(len(lookahead) == 1 && isLower(lookahead[0])) {
+			recoverStep(fmt.Sprintf("恢复：词 %q 不是单个小写终结符，丢弃", lookahead),
+				"skip-token", lookahead, top, stack, ip+1)
+			ip++
+			continue
+		}
+
+		switch {
+		case top == "$":
+			if lookahead == "$" {
+				if recovered == 0 {
+					record("接受", nil, nil)
+					return true, trace, 0
+				}
+				record(fmt.Sprintf("到达结束符：曾发生 %d 次恢复，输入含错误，不接受", recovered), nil, nil)
+				return false, trace, recovered
+			}
+			// 输入尾部多余词：逐个丢弃。
+			recoverStep(fmt.Sprintf("恢复：栈已到栈底，丢弃多余词 %s", lookahead),
+				"discard-tail", lookahead, top, stack, ip+1)
+			ip++
+		case g.terminals[top]:
+			if top == lookahead {
+				record("匹配 "+top, nil, nil)
+				stack = stack[:len(stack)-1]
+				ip++
+				continue
+			}
+			// 补入该终结符并弹栈（不消耗输入）。
+			after := stack[:len(stack)-1]
+			recoverStep(fmt.Sprintf("恢复：栈顶终结符 %s 与当前词 %s 不符，补入 %s 并弹栈", top, lookahead, top),
+				"insert-terminal", lookahead, top, after, ip)
+			stack = after
+		default:
+			cell := g.table[top][lookahead]
+			if len(cell) > 0 {
+				p := g.prods[cell[0]-1]
+				id := p.ID
+				record(fmt.Sprintf("输出 %s -> %s", p.Head, rhsDisplay(p.RHS)), &id, nil)
+				stack = stack[:len(stack)-1]
+				for i := len(p.RHS) - 1; i >= 0; i-- { // 逆序压栈，保证最左符号在栈顶
+					stack = append(stack, string(p.RHS[i]))
+				}
+				continue
+			}
+			if g.follow[top][lookahead] || lookahead == "$" {
+				// 同步集命中（或输入已结束）：弹出该非终结符。
+				after := stack[:len(stack)-1]
+				reason := fmt.Sprintf("%s ∈ FOLLOW(%s)", lookahead, top)
+				if lookahead == "$" {
+					reason = "输入已结束"
+				}
+				recoverStep(fmt.Sprintf("恢复：M[%s, %s] 为空，%s，弹出非终结符 %s", top, lookahead, reason, top),
+					"pop-nonterminal", lookahead, top, after, ip)
+				stack = after
+			} else {
+				// 无法同步：丢弃当前词。
+				recoverStep(fmt.Sprintf("恢复：M[%s, %s] 为空且 %s ∉ FOLLOW(%s)，丢弃词 %s", top, lookahead, lookahead, top, lookahead),
+					"skip-token", lookahead, top, stack, ip+1)
+				ip++
+			}
+		}
+	}
+}
+
+// analyze 是普通模式入口：首错即停，语义与恢复模式完全隔离。
 func analyze(text, start string, tokens []string) (*AnalyzeResult, error) {
+	return analyzeMode(text, start, tokens, false)
+}
+
+// analyzeMode 是入口：校验词序列长度，求集合、建表、定位冲突；
+// 有冲突时只返回表与冲突，不做任何解析回放（恢复模式也不恢复）；
+// 无冲突时才运行分析器，recoverMode 决定首错即停还是错误恢复回放。
+func analyzeMode(text, start string, tokens []string, recoverMode bool) (*AnalyzeResult, error) {
 	if len(tokens) > maxTokens {
 		return nil, fmt.Errorf("词序列长度 %d 超过上限 %d", len(tokens), maxTokens)
 	}
@@ -475,6 +611,7 @@ func analyze(text, start string, tokens []string) (*AnalyzeResult, error) {
 		First:        map[string][]string{},
 		Follow:       map[string][]string{},
 		Table:        map[string]map[string][]int{},
+		RecoverMode:  recoverMode,
 	}
 	for _, nt := range res.Nonterminals {
 		fs := sortedKeys(g.first[nt], terminalLess)
@@ -495,11 +632,16 @@ func analyze(text, start string, tokens []string) (*AnalyzeResult, error) {
 	if conflict := g.findConflict(); conflict != nil {
 		res.Status = "conflict"
 		res.Conflict = conflict
-		return res, nil // 冲突时不伪造解析结果
+		return res, nil // 冲突时不伪造解析结果，恢复模式同样不做恢复
 	}
 
 	res.Status = "parsed"
-	res.Accepted, res.Trace, res.Error = g.runParser(tokens)
+	if recoverMode {
+		res.Accepted, res.Trace, res.RecoveryCount = g.runParserRecover(tokens)
+		res.HadError = res.RecoveryCount > 0
+	} else {
+		res.Accepted, res.Trace, res.Error = g.runParser(tokens)
+	}
 	return res, nil
 }
 

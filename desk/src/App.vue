@@ -8,6 +8,7 @@ R ->
 T -> b`)
 const startSymbol = ref('E')
 const inputText = ref('b a b')
+const recoverMode = ref(false)      // 显式开启的错误恢复回放模式
 
 // ---- 请求与结果 ----
 const loading = ref(false)
@@ -72,7 +73,8 @@ async function submit() {
       body: JSON.stringify({
         grammar: grammarText.value,
         start: startSymbol.value,
-        tokens: tokens.value
+        tokens: tokens.value,
+        recover: recoverMode.value
       })
     })
     const data = await resp.json()
@@ -119,8 +121,20 @@ function rowClass(step) {
   const r = result.value
   if (!r) return ''
   if (step.action === '接受') return 'accept'
+  if (step.recovery) return 'recover'
   if (r.error && r.error.step === step.step) return 'fail'
+  // 恢复模式下走到结束符但曾出错：结论行同样标红，不得看似接受
+  if (r.recoverMode && r.hadError && step.step === r.trace.length) return 'fail'
   return ''
+}
+
+function rowTestId(step) {
+  const r = result.value
+  if (step.action === '接受') return 'trace-accept'
+  if (step.recovery) return 'trace-recovery'
+  if (r?.error && r.error.step === step.step) return 'trace-fail'
+  if (r?.recoverMode && r.hadError && step.step === r.trace.length) return 'trace-fail'
+  return 'trace-row'
 }
 </script>
 
@@ -164,6 +178,15 @@ function rowClass(step) {
             @input="touch"
           />
         </label>
+        <label class="field checkbox">
+          <input
+            type="checkbox"
+            data-testid="recover-toggle"
+            v-model="recoverMode"
+            @change="touch"
+          />
+          错误恢复回放模式：首错后继续分析，逐步标注每处恢复（默认关闭，首错即停）
+        </label>
         <button data-testid="analyze-btn" :disabled="loading" @click="submit">
           {{ loading ? '计算中…' : '计算并分析' }}
         </button>
@@ -196,6 +219,9 @@ function rowClass(step) {
               非 LL(1)：存在冲突格
             </span>
             <span v-else-if="result.accepted" class="badge ok" data-testid="badge-accepted">接受</span>
+            <span v-else-if="result.hadError" class="badge no" data-testid="badge-had-error">
+              含错误（已恢复 {{ result.recoveryCount }} 处）
+            </span>
             <span v-else class="badge no" data-testid="badge-rejected">不接受</span>
           </h2>
           <div class="meta">开始符：{{ result.start }} ｜ 非终结符：{{ result.nonterminals.join(' ') }}
@@ -269,8 +295,14 @@ function rowClass(step) {
 
         <!-- 无冲突：栈回放 -->
         <div v-else class="panel" data-testid="trace-panel">
-          <h2>预测分析回放（栈顶在左）</h2>
-          <div v-if="result.error" class="error-banner" data-testid="failure-banner" style="margin-bottom:10px">
+          <h2>
+            预测分析回放（栈顶在左）
+            <span v-if="result.recoverMode" class="badge conflict">恢复模式</span>
+          </h2>
+          <div v-if="result.recoverMode && result.hadError" class="error-banner" data-testid="recovery-banner" style="margin-bottom:10px">
+            恢复模式：发生 {{ result.recoveryCount }} 次恢复，输入含错误，结论为不接受（不伪报接受）。
+          </div>
+          <div v-else-if="result.error" class="error-banner" data-testid="failure-banner" style="margin-bottom:10px">
             第 {{ result.error.step }} 步失败：{{ result.error.reason }}
             <template v-if="result.error.token">（当前词：{{ result.error.token }}）</template>
           </div>
@@ -280,12 +312,18 @@ function rowClass(step) {
               v-for="s in result.trace"
               :key="s.step"
               :class="rowClass(s)"
-              :data-testid="s.action === '接受' ? 'trace-accept' : (result.error && result.error.step === s.step ? 'trace-fail' : 'trace-row')"
+              :data-testid="rowTestId(s)"
             >
               <span>{{ s.step }}</span>
               <span>{{ s.stack }}</span>
               <span>{{ s.input }}</span>
-              <span>{{ s.action }}</span>
+              <span>
+                {{ s.action }}
+                <div v-if="s.recovery" class="recovery-detail" data-testid="recovery-detail">
+                  词下标 {{ s.recovery.tokenIndex }}（{{ s.recovery.token }}）· 原栈顶 {{ s.recovery.stackTop }}
+                  · 恢复后：栈 {{ s.recovery.afterStack }} ｜ 输入 {{ s.recovery.afterInput }}
+                </div>
+              </span>
             </li>
           </ol>
         </div>

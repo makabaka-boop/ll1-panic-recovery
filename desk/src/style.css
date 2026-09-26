@@ -105,6 +105,22 @@ ol.trace li {
 ol.trace li.head { font-weight: 700; background: #f0f4f8; font-family: inherit; white-space: normal; }
 ol.trace li.fail { background: #fde2e2; color: #ab0909; }
 ol.trace li.accept { background: #def7ec; color: #03543f; font-weight: 700; }
+ol.trace li.recover { background: #fff7ed; color: #9a3412; }
+.recovery-detail {
+  font-size: 12px;
+  color: #9a3412;
+  white-space: normal;
+  border-top: 1px dashed #fdba74;
+  margin-top: 2px;
+  padding-top: 2px;
+}
+label.field.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+label.field.checkbox input { margin: 0; }
 .meta { font-size: 12px; color: #627d98; margin-top: 8px; }
 .stale-warn {
   background: #fff7ed; border: 1px dashed #fb923c; color: #9a3412;
