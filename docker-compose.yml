@@ -1,0 +1,16 @@
+services:
+  grammar:
+    build: ./grammar
+    environment:
+      - PORT=8080
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  desk:
+    build: ./desk
+    ports:
+      - "8081:80"
+    depends_on:
+      - grammar
+    restart: unless-stopped
