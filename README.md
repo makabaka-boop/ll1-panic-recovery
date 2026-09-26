@@ -23,16 +23,24 @@
    及其全部竞争规则，**不生成任何解析回放**。
 5. 无冲突时才运行分析器，逐步回放 栈 / 剩余输入 / 所用规则；非法词或查表为空
    都在**首个失败步骤**停止并保留现场。
+6. **错误恢复回放模式**（请求显式携带 `"recover": true` 才开启）：FIRST/FOLLOW/预测表
+   仍先完整计算，冲突结论不变、不做恢复。无冲突时首错之后继续回放——
+   非终结符查表为空且当前词 ∈ FOLLOW（或为结束符 `$`）则弹出该非终结符，否则丢弃当前词；
+   栈顶终结符与当前词不符则补入该终结符并弹栈（不消费输入）；栈空后尾部多余词逐个丢弃。
+   每次恢复记录 词下标 / 原栈顶 / 动作 / 恢复后的现场（`recovery` 事件与 `trace` 同序编号），
+   只要发生过恢复，即使走到结束符也标「含错误」、`accepted=false`，绝不伪报接受。
+   每个恢复动作都严格缩小 栈规模或剩余输入，总步数以 10000 为硬上限，保证终止。
 
 ## 目录
 
 ```
 grammar/          Go 服务（核心算法 + net/http，POST /api/analyze，GET /healthz）
-  ll1.go          解析、不动点 FIRST/FOLLOW、LL(1) 表、冲突定位、栈回放
+  ll1.go          解析、不动点 FIRST/FOLLOW、LL(1) 表、冲突定位、栈回放、错误恢复回放
   ll1_test.go     间接 ε 传播 / FOLLOW 冲突 / 递归文法 / 非法词 / 去重 / 上限
+                  + 恢复模式：连续错误 / FOLLOW 同步 / 输入耗尽 / ε 产生式 / 旧模式兼容
 desk/             Vue 3 + Vite 前端
-  src/App.vue     文法与词序列编辑、请求版本隔离、表与回放展示
-  e2e/            Playwright 端到端流程（编辑 → 失败栈 → 冲突）
+  src/App.vue     文法与词序列编辑、恢复模式开关、请求版本隔离、表与回放展示
+  e2e/            Playwright 端到端流程（编辑 → 失败栈 → 冲突；恢复模式全场景）
 docker-compose.yml  grammar（内部 :8080）+ desk（宿主机 :8081，nginx 反代 /api）
 ```
 
@@ -72,7 +80,15 @@ npm run test:e2e
 curl -s -X POST http://localhost:8080/api/analyze \
   -H 'Content-Type: application/json' \
   -d '{"grammar":"E -> T R\nR -> a T R\nR ->\nT -> b","start":"E","tokens":["b","a","b"]}'
+
+# 错误恢复回放模式（显式开启）
+curl -s -X POST http://localhost:8080/api/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"grammar":"S -> q X d\nX -> a","start":"S","tokens":["q","d"],"recover":true}'
 ```
 
 返回 `status` 为 `conflict`（含最小冲突格 `conflict`，无 `trace`）或
 `parsed`（含 `accepted` 与逐步 `trace`；失败时 `error` 指向首个失败步骤）。
+`mode` 为 `strict`（首错即停）或 `recover`（错误恢复回放）；恢复模式下
+`recovery` 按步骤号给出每次恢复的词下标、原栈顶、动作与恢复后的现场，
+发生过恢复时 `accepted` 恒为 `false`（结论「含错误」）。

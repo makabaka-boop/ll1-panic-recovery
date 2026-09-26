@@ -79,6 +79,13 @@ button.secondary { background: #627d98; margin-left: 8px; }
 .badge.ok { background: #def7ec; color: #03543f; }
 .badge.no { background: #fde2e2; color: #ab0909; }
 .badge.conflict { background: #fef3c7; color: #92400e; }
+.badge.warn { background: #fef3c7; color: #92400e; }
+
+label.check {
+  display: block; margin-bottom: 10px; font-size: 13px; color: #334e68;
+  line-height: 1.5; cursor: pointer;
+}
+label.check input { margin-right: 6px; vertical-align: -2px; }
 
 table.sets, table.ll1 { border-collapse: collapse; width: 100%; font-size: 13px; }
 table.sets th, table.sets td, table.ll1 th, table.ll1 td {
@@ -105,6 +112,30 @@ ol.trace li {
 ol.trace li.head { font-weight: 700; background: #f0f4f8; font-family: inherit; white-space: normal; }
 ol.trace li.fail { background: #fde2e2; color: #ab0909; }
 ol.trace li.accept { background: #def7ec; color: #03543f; font-weight: 700; }
+ol.trace li.recover { background: #fff7ed; color: #9a3412; }
+ol.trace li.errend { background: #fde2e2; color: #ab0909; font-weight: 700; }
+
+.recovery-box {
+  background: #fff7ed;
+  border: 1px solid #fdba74;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.recovery-head { margin: 0 0 6px; font-size: 12px; color: #9a3412; font-weight: 600; }
+ol.recovery-list {
+  list-style: none; margin: 0; padding-left: 0;
+  font-family: Consolas, monospace; font-size: 12.5px; color: #7c2d12;
+}
+ol.recovery-list li {
+  display: grid;
+  grid-template-columns: 64px 110px 80px 1.4fr 1.2fr;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed #fed7aa;
+  white-space: pre;
+}
+ol.recovery-list li:last-child { border-bottom: 0; }
 .meta { font-size: 12px; color: #627d98; margin-top: 8px; }
 .stale-warn {
   background: #fff7ed; border: 1px dashed #fb923c; color: #9a3412;

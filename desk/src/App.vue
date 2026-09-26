@@ -8,6 +8,7 @@ R ->
 T -> b`)
 const startSymbol = ref('E')
 const inputText = ref('b a b')
+const recoverMode = ref(false)   // 显式开启的错误恢复回放模式
 
 // ---- 请求与结果 ----
 const loading = ref(false)
@@ -32,6 +33,21 @@ const prodById = computed(() => {
   result.value?.productions.forEach(p => m.set(p.id, p))
   return m
 })
+
+// 恢复事件与回放是同一事件序列：按步骤号索引，供回放行高亮与事件列表共用。
+const recoveryByStep = computed(() => {
+  const m = new Map()
+  result.value?.recovery?.forEach(e => m.set(e.step, e))
+  return m
+})
+const hasRecovery = computed(() => (result.value?.recovery?.length ?? 0) > 0)
+const lastStepNum = computed(() => result.value?.trace?.length ?? 0)
+
+// 含错误的收尾步骤：恢复模式下走到结束符但不予接受的最后一步。
+function isErrEnd(step) {
+  const r = result.value
+  return !!r && r.mode === 'recover' && hasRecovery.value && !r.accepted && !r.error && step.step === lastStepNum.value
+}
 
 function rhsDisplay(p) {
   if (p.epsilon) return 'ε'
@@ -72,7 +88,8 @@ async function submit() {
       body: JSON.stringify({
         grammar: grammarText.value,
         start: startSymbol.value,
-        tokens: tokens.value
+        tokens: tokens.value,
+        recover: recoverMode.value
       })
     })
     const data = await resp.json()
@@ -120,7 +137,19 @@ function rowClass(step) {
   if (!r) return ''
   if (step.action === '接受') return 'accept'
   if (r.error && r.error.step === step.step) return 'fail'
+  if (recoveryByStep.value.has(step.step)) return 'recover'
+  if (isErrEnd(step)) return 'errend'
   return ''
+}
+
+function rowTestId(step) {
+  const r = result.value
+  if (!r) return 'trace-row'
+  if (step.action === '接受') return 'trace-accept'
+  if (r.error && r.error.step === step.step) return 'trace-fail'
+  if (recoveryByStep.value.has(step.step)) return 'trace-recover'
+  if (isErrEnd(step)) return 'trace-errend'
+  return 'trace-row'
 }
 </script>
 
@@ -164,6 +193,15 @@ function rowClass(step) {
             @input="touch"
           />
         </label>
+        <label class="check">
+          <input
+            type="checkbox"
+            data-testid="recover-toggle"
+            v-model="recoverMode"
+            @change="touch"
+          />
+          错误恢复回放模式（首错后继续：FOLLOW 同步弹出 / 丢弃错误词 / 补入终结符，结论标「含错误」）
+        </label>
         <button data-testid="analyze-btn" :disabled="loading" @click="submit">
           {{ loading ? '计算中…' : '计算并分析' }}
         </button>
@@ -196,6 +234,10 @@ function rowClass(step) {
               非 LL(1)：存在冲突格
             </span>
             <span v-else-if="result.accepted" class="badge ok" data-testid="badge-accepted">接受</span>
+            <span v-else-if="result.error" class="badge no" data-testid="badge-rejected">不接受</span>
+            <span v-else-if="hasRecovery" class="badge warn" data-testid="badge-erroneous">
+              含错误（已恢复 {{ result.recovery.length }} 处，不予接受）
+            </span>
             <span v-else class="badge no" data-testid="badge-rejected">不接受</span>
           </h2>
           <div class="meta">开始符：{{ result.start }} ｜ 非终结符：{{ result.nonterminals.join(' ') }}
@@ -269,10 +311,27 @@ function rowClass(step) {
 
         <!-- 无冲突：栈回放 -->
         <div v-else class="panel" data-testid="trace-panel">
-          <h2>预测分析回放（栈顶在左）</h2>
+          <h2>预测分析回放（栈顶在左）
+            <span v-if="result.mode === 'recover'" class="badge warn">恢复模式</span>
+          </h2>
           <div v-if="result.error" class="error-banner" data-testid="failure-banner" style="margin-bottom:10px">
             第 {{ result.error.step }} 步失败：{{ result.error.reason }}
             <template v-if="result.error.token">（当前词：{{ result.error.token }}）</template>
+          </div>
+          <!-- 恢复事件：与回放同一事件序列，写明词下标、原栈顶、动作及恢复后的现场 -->
+          <div v-if="hasRecovery" class="recovery-box" data-testid="recovery-panel">
+            <p class="recovery-head">
+              错误恢复事件（{{ result.recovery.length }} 次；词下标从 0 起，现场为恢复动作之后）：
+            </p>
+            <ol class="recovery-list">
+              <li v-for="e in result.recovery" :key="e.step" data-testid="recovery-event">
+                <span>步骤 {{ e.step }}</span>
+                <span>词下标 {{ e.tokenIndex }}（{{ e.token }}）</span>
+                <span>原栈顶 {{ e.stackTop }}</span>
+                <span>{{ e.action }}</span>
+                <span>恢复后 栈：{{ e.stack }} ｜ 剩余：{{ e.input }}</span>
+              </li>
+            </ol>
           </div>
           <ol class="trace">
             <li class="head"><span>步骤</span><span>栈</span><span>剩余输入</span><span>动作</span></li>
@@ -280,7 +339,7 @@ function rowClass(step) {
               v-for="s in result.trace"
               :key="s.step"
               :class="rowClass(s)"
-              :data-testid="s.action === '接受' ? 'trace-accept' : (result.error && result.error.step === s.step ? 'trace-fail' : 'trace-row')"
+              :data-testid="rowTestId(s)"
             >
               <span>{{ s.step }}</span>
               <span>{{ s.stack }}</span>

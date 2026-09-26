@@ -13,6 +13,7 @@ type analyzeRequest struct {
 	Start   string   `json:"start"`
 	Tokens  []string `json:"tokens"`
 	Input   string   `json:"input"`
+	Recover bool     `json:"recover"` // 显式开启错误恢复回放模式；缺省 false 保持首错即停
 }
 
 type errorResponse struct {
@@ -42,7 +43,7 @@ func handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		tokens = strings.Fields(req.Input) // 兼容直接提交空白分隔的输入串
 	}
 
-	result, err := analyze(req.Grammar, req.Start, tokens)
+	result, err := analyze(req.Grammar, req.Start, tokens, req.Recover)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return

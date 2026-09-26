@@ -79,7 +79,7 @@ func TestFollowConflict(t *testing.T) {
 		"Q -> e P",
 		"Q ->",
 		"P -> s",
-	}, "\n"), "P", []string{"i"})
+	}, "\n"), "P", []string{"i"}, false)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestLeftRecursiveGrammarConflict(t *testing.T) {
 		"E -> T",
 		"T -> b",
 	}, "\n")
-	res, err := analyze(text, "E", []string{"b"})
+	res, err := analyze(text, "E", []string{"b"}, false)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestRightRecursiveGrammarTrace(t *testing.T) {
 		"T -> b",
 	}, "\n")
 
-	res, err := analyze(text, "E", strings.Split("b a b", " "))
+	res, err := analyze(text, "E", strings.Split("b a b", " "), false)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestRightRecursiveGrammarTrace(t *testing.T) {
 	}
 
 	// 拒绝序列：M[R, b] 为空，必须在首个失败步骤停下并保留现场。
-	res2, err := analyze(text, "E", strings.Split("b b", " "))
+	res2, err := analyze(text, "E", strings.Split("b b", " "), false)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestRightRecursiveGrammarTrace(t *testing.T) {
 // 4) 非法词（非小写终结符）在真正匹配前即报第一个失败步骤。
 func TestIllegalToken(t *testing.T) {
 	text := "E -> b"
-	res, err := analyze(text, "E", []string{"B"})
+	res, err := analyze(text, "E", []string{"B"}, false)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestDuplicateProductionInCellNotConflict(t *testing.T) {
 		"A -> b A",
 		"A ->",
 	}, "\n")
-	res, err := analyze(text, "S", []string{"b", "b", "a"})
+	res, err := analyze(text, "S", []string{"b", "b", "a"}, false)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -200,7 +200,271 @@ func TestLimits(t *testing.T) {
 	if _, err := parseGrammar(strings.Join(lines, "\n"), "A"); err == nil {
 		t.Fatal("31 条不同产生式应报错")
 	}
-	if _, err := analyze("A -> b", "A", make([]string, 41)); err == nil {
+	if _, err := analyze("A -> b", "A", make([]string, 41), false); err == nil {
 		t.Fatal("41 个输入词应报错")
+	}
+}
+
+// ---- 错误恢复回放模式 ----
+//
+// 恢复测试共用文法：S -> q X d，X -> a。
+// FIRST(S)={q}，FIRST(X)={a}，FOLLOW(X)={d}，FOLLOW(S)={$}。
+const recoverGrammar = "S -> q X d\nX -> a"
+
+// checkRecoveryProgress 校验「所有动作保证推进」：每次恢复要么栈变短、要么剩余输入变短；
+// 且恢复事件与回放步骤是同一事件序列（步骤号、动作文本一致），总步数不超上限。
+func checkRecoveryProgress(t *testing.T, res *AnalyzeResult) {
+	t.Helper()
+	if len(res.Trace) > maxSteps {
+		t.Fatalf("回放步数 %d 超过上限 %d", len(res.Trace), maxSteps)
+	}
+	for _, ev := range res.Recovery {
+		before := res.Trace[ev.Step-1]
+		if before.Action != ev.Action {
+			t.Errorf("恢复事件步骤 %d 与回放动作不一致：%q vs %q", ev.Step, ev.Action, before.Action)
+		}
+		bStack, aStack := len(strings.Fields(before.Stack)), len(strings.Fields(ev.Stack))
+		bInput, aInput := len(strings.Fields(before.Input)), len(strings.Fields(ev.Input))
+		if aStack >= bStack && aInput >= bInput {
+			t.Errorf("步骤 %d 的恢复未推进：栈 %d→%d，剩余输入 %d→%d", ev.Step, bStack, aStack, bInput, aInput)
+		}
+	}
+}
+
+// lastAction 返回回放最后一步的动作文本。
+func lastAction(res *AnalyzeResult) string {
+	return res.Trace[len(res.Trace)-1].Action
+}
+
+//  7. FOLLOW 同步：输入 q d 缺少 a，M[X, d] 为空且 d ∈ FOLLOW(X)，弹出 X 后继续到结束符。
+//     即使走到结束符也必须标「含错误」，不得伪报接受。
+func TestRecoveryFollowSync(t *testing.T) {
+	res, err := analyze(recoverGrammar, "S", []string{"q", "d"}, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Mode != "recover" || res.Status != "parsed" {
+		t.Fatalf("mode=%q status=%q，期望 recover/parsed", res.Mode, res.Status)
+	}
+	if res.Accepted {
+		t.Fatal("发生过恢复的输入即使走到结束符也不得接受")
+	}
+	if res.Error != nil {
+		t.Fatalf("恢复模式不应返回首错即停的 Failure：%+v", res.Error)
+	}
+	if len(res.Recovery) != 1 {
+		t.Fatalf("恢复事件数 = %d，期望 1：%+v", len(res.Recovery), res.Recovery)
+	}
+	ev := res.Recovery[0]
+	if ev.TokenIndex != 1 || ev.Token != "d" || ev.StackTop != "X" {
+		t.Errorf("事件 = %+v，期望词下标 1、词 d、原栈顶 X", ev)
+	}
+	if !strings.Contains(ev.Action, "FOLLOW") || !strings.Contains(ev.Action, "弹出 X") {
+		t.Errorf("恢复动作 = %q，期望说明 d ∈ FOLLOW(X) 并弹出 X", ev.Action)
+	}
+	if ev.Stack != "d $" || ev.Input != "d $" {
+		t.Errorf("恢复后现场 = 栈 %q 输入 %q，期望 d $ / d $", ev.Stack, ev.Input)
+	}
+	if got := lastAction(res); !strings.Contains(got, "含错误") {
+		t.Errorf("最后一步动作 = %q，期望标注含错误", got)
+	}
+	// 恢复后继续正常推导：第 4 步应匹配 d。
+	if res.Trace[3].Action != "匹配 d" {
+		t.Errorf("恢复后第 4 步 = %q，期望 匹配 d", res.Trace[3].Action)
+	}
+	checkRecoveryProgress(t, res)
+}
+
+// 8) 连续错误：q x y d 中 x、y 连续两个错误词都被逐个丢弃，随后 FOLLOW 同步弹出 X。
+func TestRecoveryConsecutiveErrors(t *testing.T) {
+	res, err := analyze(recoverGrammar, "S", []string{"q", "x", "y", "d"}, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Accepted || len(res.Recovery) != 3 {
+		t.Fatalf("accepted=%v 事件数=%d，期望 false/3", res.Accepted, len(res.Recovery))
+	}
+	for i, ev := range res.Recovery[:2] {
+		if !strings.Contains(ev.Action, "丢弃当前词") {
+			t.Errorf("事件 %d 动作 = %q，期望丢弃当前词", i, ev.Action)
+		}
+		if ev.TokenIndex != i+1 {
+			t.Errorf("事件 %d 词下标 = %d，期望 %d", i, ev.TokenIndex, i+1)
+		}
+	}
+	if !strings.Contains(res.Recovery[2].Action, "弹出 X") {
+		t.Errorf("第 3 次恢复 = %q，期望 FOLLOW 同步弹出 X", res.Recovery[2].Action)
+	}
+	// 丢弃 x 后剩余输入应从 y 开始。
+	if res.Recovery[0].Input != "y d $" {
+		t.Errorf("丢弃 x 后剩余输入 = %q，期望 y d $", res.Recovery[0].Input)
+	}
+	if got := lastAction(res); !strings.Contains(got, "含错误") {
+		t.Errorf("最后一步动作 = %q，期望标注含错误", got)
+	}
+	checkRecoveryProgress(t, res)
+}
+
+// 9) 输入耗尽：q 之后输入结束，先按结束符同步弹出 X，再补入终结符 d（弹栈不消费输入）。
+func TestRecoveryInputExhausted(t *testing.T) {
+	res, err := analyze(recoverGrammar, "S", []string{"q"}, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Accepted || len(res.Recovery) != 2 {
+		t.Fatalf("accepted=%v 事件数=%d，期望 false/2", res.Accepted, len(res.Recovery))
+	}
+	pop, insert := res.Recovery[0], res.Recovery[1]
+	if pop.Token != "$" || pop.TokenIndex != 1 || pop.StackTop != "X" {
+		t.Errorf("结束符同步事件 = %+v，期望词 $、下标 1、栈顶 X", pop)
+	}
+	if !strings.Contains(pop.Action, "结束符") || !strings.Contains(pop.Action, "弹出 X") {
+		t.Errorf("结束符同步动作 = %q", pop.Action)
+	}
+	if !strings.Contains(insert.Action, "补入 d") || insert.StackTop != "d" {
+		t.Errorf("补入事件 = %+v，期望补入 d、原栈顶 d", insert)
+	}
+	if insert.TokenIndex != 1 {
+		t.Errorf("补入不应消费输入，词下标 = %d，期望仍为 1", insert.TokenIndex)
+	}
+	if insert.Stack != "$" {
+		t.Errorf("补入 d 后栈 = %q，期望 $", insert.Stack)
+	}
+	if got := lastAction(res); !strings.Contains(got, "含错误") {
+		t.Errorf("最后一步动作 = %q，期望标注含错误", got)
+	}
+	checkRecoveryProgress(t, res)
+}
+
+//  10. 零长度产生式：ε 规则在恢复模式下照常参与推导；其前的错误词被丢弃。
+//     同一文法的合法输入在恢复模式下仍应正常接受、无恢复事件。
+func TestRecoveryEpsilonProduction(t *testing.T) {
+	text := "S -> A b\nA ->"
+	res, err := analyze(text, "S", []string{"x", "b"}, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Accepted || len(res.Recovery) != 1 {
+		t.Fatalf("accepted=%v 事件数=%d，期望 false/1", res.Accepted, len(res.Recovery))
+	}
+	ev := res.Recovery[0]
+	if ev.TokenIndex != 0 || ev.StackTop != "S" || !strings.Contains(ev.Action, "丢弃") {
+		t.Errorf("事件 = %+v，期望词下标 0、栈顶 S、丢弃", ev)
+	}
+	hasEpsStep := false
+	for _, s := range res.Trace {
+		if s.Action == "输出 A -> ε" {
+			hasEpsStep = true
+			if s.ProductionID == nil {
+				t.Error("ε 产生式步骤应携带产生式编号")
+			}
+		}
+	}
+	if !hasEpsStep {
+		t.Error("恢复后应照常输出零长度产生式 A -> ε")
+	}
+	if got := lastAction(res); !strings.Contains(got, "含错误") {
+		t.Errorf("最后一步动作 = %q，期望标注含错误", got)
+	}
+	checkRecoveryProgress(t, res)
+
+	// 合法输入：恢复模式不改变接受语义。
+	clean, err := analyze(text, "S", []string{"b"}, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if !clean.Accepted || len(clean.Recovery) != 0 {
+		t.Fatalf("合法输入在恢复模式下应接受且无恢复：accepted=%v recovery=%+v", clean.Accepted, clean.Recovery)
+	}
+	if lastAction(clean) != "接受" {
+		t.Errorf("合法输入最后一步 = %q，期望 接受", lastAction(clean))
+	}
+}
+
+// 11) 输入尾部多余词：栈已空后逐个丢弃，每个词各记一次恢复事件。
+func TestRecoveryTailDiscard(t *testing.T) {
+	res, err := analyze("S -> a", "S", []string{"a", "b", "c"}, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Accepted || len(res.Recovery) != 2 {
+		t.Fatalf("accepted=%v 事件数=%d，期望 false/2", res.Accepted, len(res.Recovery))
+	}
+	for i, ev := range res.Recovery {
+		if ev.StackTop != "$" || !strings.Contains(ev.Action, "多余词") {
+			t.Errorf("事件 %d = %+v，期望栈顶 $ 且丢弃多余词", i, ev)
+		}
+		if ev.TokenIndex != i+1 {
+			t.Errorf("事件 %d 词下标 = %d，期望 %d", i, ev.TokenIndex, i+1)
+		}
+	}
+	if res.Recovery[0].Input != "c $" {
+		t.Errorf("丢弃 b 后剩余输入 = %q，期望 c $", res.Recovery[0].Input)
+	}
+	checkRecoveryProgress(t, res)
+}
+
+// 12) 终止性硬上限：40 个全错词也必须在有限步内结束，且每步恢复都推进。
+func TestRecoveryAlwaysTerminates(t *testing.T) {
+	tokens := make([]string, 40)
+	for i := range tokens {
+		tokens[i] = "x"
+	}
+	res, err := analyze(recoverGrammar, "S", tokens, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Accepted {
+		t.Fatal("全错输入不得接受")
+	}
+	if len(res.Recovery) != 41 { // 40 次丢弃 + 结束符同步弹出 S
+		t.Fatalf("恢复事件数 = %d，期望 41", len(res.Recovery))
+	}
+	checkRecoveryProgress(t, res)
+}
+
+// 13) 冲突文法：恢复模式不改变冲突结论，不生成回放与恢复事件。
+func TestRecoveryConflictKeepsConclusion(t *testing.T) {
+	text := strings.Join([]string{
+		"P -> i b P Q",
+		"Q -> e P",
+		"Q ->",
+		"P -> s",
+	}, "\n")
+	res, err := analyze(text, "P", []string{"i"}, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Status != "conflict" || res.Conflict == nil {
+		t.Fatalf("status=%q，期望 conflict 且带冲突格", res.Status)
+	}
+	if res.Conflict.Nonterminal != "Q" || res.Conflict.Terminal != "e" {
+		t.Errorf("冲突格 = (%s,%s)，期望 (Q,e)", res.Conflict.Nonterminal, res.Conflict.Terminal)
+	}
+	if res.Trace != nil || len(res.Recovery) != 0 || res.Accepted {
+		t.Errorf("冲突时不应有回放/恢复/接受：trace=%v recovery=%v accepted=%v", res.Trace, res.Recovery, res.Accepted)
+	}
+}
+
+// 14) 旧模式兼容：不开恢复时首错即停语义不变，无恢复事件，mode 为 strict。
+func TestStrictModeUnchanged(t *testing.T) {
+	res, err := analyze(recoverGrammar, "S", []string{"q", "d"}, false)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	if res.Mode != "strict" {
+		t.Errorf("mode = %q，期望 strict", res.Mode)
+	}
+	if res.Accepted || res.Error == nil {
+		t.Fatal("普通模式应在首个错误步骤失败")
+	}
+	if res.Error.Step != 3 || !strings.Contains(res.Error.Reason, "M[X, d]") {
+		t.Errorf("失败 = %+v，期望第 3 步 M[X, d] 为空", res.Error)
+	}
+	if len(res.Trace) != 3 {
+		t.Errorf("普通模式应首错即停，回放步数 = %d，期望 3", len(res.Trace))
+	}
+	if len(res.Recovery) != 0 {
+		t.Errorf("普通模式不应产生恢复事件：%+v", res.Recovery)
 	}
 }
